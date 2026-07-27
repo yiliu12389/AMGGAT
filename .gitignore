@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Model checkpoints
+*.pt
+*.pth
+
+# Logs
+pdn_amg/logs/
+
+# Data / cache
+pdn_amg/data_cache/
+ML-for-IR-drop/
+
+# Personal dotfiles / IDE
+.bash_history
+.bash_profile
+.bashrc
+.zshrc
+.profile
+.gitconfig
+.viminfo
+.wget-hsts
+.node_repl_history
+.ssh/
+.vscode/
+.vscode-server/
+.vscode-remote-containers/
+.claude/
+.claude.json*
+.cache/
+.conda/
+.config/
+.copilot/
+.dotnet/
+.ipython/
+.jupyter/
+.keras/
+.local/
+.log/
+.npm/
+.nvm/
+.ssgetpy/
+.triton/
+clash/
