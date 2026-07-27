@@ -129,7 +129,7 @@ if __name__ == '__main__':
     LAM = 0.1
     CKPT_NAME = os.environ.get('CKPT_NAME', 'ckpt_gat')
     ANCHOR_FRAC = float(os.environ.get('ANCHOR_FRAC', 0.0))
-    ANCHOR_MAX  = float(os.environ.get('ANCHOR_MAX', 0.0))   # >0 => per-graph uniform [0, ANCHOR_MAX]
+    ANCHOR_MAX  = float(os.environ.get('ANCHOR_MAX', 0.0))  
     LOSS = os.environ.get('LOSS', 'mse').lower()          # 'mse' | 'log_mse'
     LOG_EPS = float(os.environ.get('LOG_EPS', 0.01))       # mV floor for log
     ENCODING = os.environ.get('ENCODING', 'v_ratio')       # 'v_ratio' | 'known_drop'
