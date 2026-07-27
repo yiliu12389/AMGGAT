@@ -1,15 +1,3 @@
-"""
-amg_gat.py — Hierarchical AMG+GAT for PDN IR-drop prediction.
-
-Architecture (top-down fusion):
-  Each AMG level runs an independent GAT → hidden state h_l.
-  After all levels finish, coarse h is prolonged and added (with learnable
-  projection + LN) to the finer h:
-      h1 ← LN(h1 + proj(P_12 @ h2))
-      h0 ← LN(h0 + proj(P_01 @ h1))
-  Decoder runs on h0 → IR-drop prediction.
-"""
-
 import os, time
 import numpy as np
 import torch
@@ -29,7 +17,6 @@ from metrics import metrics_A, metrics_B
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LevelGAT(nn.Module):
-    """Independent GAT for one AMG level."""
     def __init__(self, in_dim, head_dim, heads, n_layers):
         super().__init__()
         layers, d = [], in_dim
@@ -47,53 +34,40 @@ class LevelGAT(nn.Module):
         ef = graph['edge_feat']
         for layer in self.layers:
             h = layer(h, row, col, N, ef)
-        return h  # (N, head_dim)
+        return h  
 
 
 class AMGGAT(nn.Module):
     def __init__(self, in_dim=5, head_dim=32, heads=4,
-                 layers_per_level=(4, 3, 2)):
+                 layers_per_level=(4, 3, 3, 2, 2)):
         super().__init__()
         self.n_levels = len(layers_per_level)
-        self.gnns = nn.ModuleList([
-            LevelGAT(in_dim, head_dim, heads, layers_per_level[l])
-            for l in range(self.n_levels)
-        ])
-        # one proj + LN per coarse→fine fusion step
-        self.projs = nn.ModuleList([
-            nn.Linear(head_dim, head_dim, bias=False)
-            for _ in range(self.n_levels - 1)
-        ])
-        self.lns = nn.ModuleList([
-            nn.LayerNorm(head_dim) for _ in range(self.n_levels - 1)
-        ])
+        self.head_dim = head_dim
+
+        gats = []
+        for step, n_lay in enumerate(layers_per_level):
+            gat_in = in_dim if step == 0 else in_dim + head_dim
+            gats.append(LevelGAT(gat_in, head_dim, heads, n_lay))
+        self.level_gats = nn.ModuleList(gats)
+
         dec_h = head_dim * 2
         self.dec = nn.Sequential(
-            nn.Linear(head_dim, dec_h), nn.ReLU(inplace=True),
-            nn.Linear(dec_h, 1), nn.Softplus(),
+            nn.Linear(head_dim, dec_h),
+            nn.ReLU(inplace=True),
+            nn.Linear(dec_h, 1),
         )
-        nn.init.xavier_uniform_(self.dec[0].weight)
-        nn.init.zeros_(self.dec[0].bias)
-        nn.init.normal_(self.dec[2].weight, std=0.01)
-        nn.init.constant_(self.dec[2].bias, -6.5)
-        for p in self.projs:
-            nn.init.xavier_uniform_(p.weight)
+        nn.init.zeros_(self.dec[-1].weight)
+        nn.init.zeros_(self.dec[-1].bias)
 
     def forward(self, graphs, features, P_tensors):
-        """
-        graphs    : list of graph dicts [L0, L1, L2, ...]
-        features  : list of feature tensors per level
-        P_tensors : P_tensors[l] sparse (N_l, N_{l+1})
-        """
-        hs = [self.gnns[l](features[l], graphs[l])
-              for l in range(self.n_levels)]
-
-        # top-down: coarsest → finest
-        for l in range(self.n_levels - 2, -1, -1):
-            h_up = torch.sparse.mm(P_tensors[l], hs[l + 1])  # (N_l, head_dim)
-            hs[l] = self.lns[l](hs[l] + self.projs[l](h_up))
-
-        return self.dec(hs[0]).squeeze(-1)
+        L = self.n_levels
+        h = self.level_gats[0](features[L - 1], graphs[L - 1])
+        for step in range(1, L):
+            lvl = L - 1 - step        
+            h = torch.sparse.mm(P_tensors[lvl], h)         
+            x = torch.cat([features[lvl], h], dim=-1)      
+            h = self.level_gats[step](x, graphs[lvl])
+        return self.dec(h).squeeze(-1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -191,7 +165,7 @@ if __name__ == '__main__':
     LR          = float(os.environ.get('LR', 1e-4))
     HEAD_DIM    = int(os.environ.get('HEAD_DIM', 32))
     HEADS       = int(os.environ.get('HEADS', 4))
-    LAYERS      = os.environ.get('LAYERS', '4,3,2')   # layers per AMG level
+    LAYERS      = os.environ.get('LAYERS', '4,3,2') 
     MAX_LEVELS  = int(os.environ.get('MAX_LEVELS', 3))
     CKPT_NAME   = os.environ.get('CKPT_NAME', 'ckpt_amg_gat')
     ANCHOR_FRAC = float(os.environ.get('ANCHOR_FRAC', 0.0))
