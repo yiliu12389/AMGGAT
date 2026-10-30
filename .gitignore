@@ -8,10 +8,10 @@ __pycache__/
 *.pth
 
 # Logs
-pdn_amg/logs/
+logs/
 
 # Data / cache
-pdn_amg/data_cache/
+data_cache/
 ML-for-IR-drop/
 
 # Personal dotfiles / IDE

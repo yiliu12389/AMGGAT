@@ -2,7 +2,10 @@ import os, time
 import numpy as np
 import torch
 
-from pdn_data import build_graph, build_features, load_sample, load_group, load_group_flat
+from data import build_graph, build_features, load_sample, load_group, load_group_flat
+from data.normalization import (
+    apply_node_zscore, normalize_graph, restore_zscore,
+)
 
 
 # ============================================================================
@@ -43,34 +46,56 @@ def metrics_B(drop_p_norm, drop_g_norm, vdd):
 # ============================================================================
 # Batch evaluation
 # ============================================================================
-def eval_samples(model, samples, device, tag='', feature_fn=None, anchor_frac=0.0):
+def eval_samples(model, samples, device, tag='', feature_fn=None,
+                 node_stats=None, edge_stats=None, target_stats=None):
     if feature_fn is None:
         feature_fn = build_features
-    rng = np.random.default_rng(0)
     model.eval()
     per_tc = []
-    per_A, per_B, per_T = [], [], []
+    per_A, per_B, per_MSE, per_CC, per_T = [], [], [], [], []
+    within10_nodes = 0
+    valid_nodes = 0
     for tc, A_sp, b_np, b_vdd, b_iso, li, x_gt, mask, vdd in samples:
         try:
-            g   = build_graph(A_sp, b_vdd, device)
-            xin = feature_fn(A_sp, b_vdd, b_iso, li, device,
-                             x_gt=x_gt, gt_mask=mask, vdd=vdd,
-                             anchor_frac=anchor_frac, rng=rng)
-            drop_gt_n = torch.from_numpy(
-                ((vdd - x_gt) / vdd).astype(np.float32)).to(device)
+            g   = build_graph(A_sp, device)
+            if edge_stats is not None:
+                normalize_graph(g, edge_stats)
+            xin = feature_fn(A_sp, b_vdd, b_iso, li, device)
+            if node_stats is not None:
+                xin = apply_node_zscore(xin, node_stats)
+            gt_mv_all = torch.from_numpy(
+                ((vdd - x_gt) * 1000.0).astype(np.float32)).to(device)
 
             if str(device).startswith('cuda'):
                 torch.cuda.synchronize()
             t0 = time.time()
             with torch.no_grad():
-                drop_pred = model(g, xin)                    
+                pred_raw = model(g, xin)
+                if target_stats is not None:
+                    pred_mv_all = restore_zscore(pred_raw, target_stats)
+                else:
+                    pred_mv_all = pred_raw * (vdd * 1000.0)
             if str(device).startswith('cuda'):
                 torch.cuda.synchronize()
             runtime = time.time() - t0
             per_T.append(runtime)
 
             mm_b = torch.from_numpy(mask).to(device)
-            mae_b, r2_b = metrics_B(drop_pred[mm_b], drop_gt_n[mm_b], vdd)
+            pred_mv = pred_mv_all[mm_b]
+            gt_mv = gt_mv_all[mm_b]
+            error_mv = pred_mv - gt_mv
+            per_MSE.append(float(error_mv.square().mean().item()))
+            within10_nodes += int((error_mv.abs() <= 0.1 * gt_mv.abs()).sum().item())
+            valid_nodes += int(gt_mv.numel())
+            pred_centered = pred_mv - pred_mv.mean()
+            gt_centered = gt_mv - gt_mv.mean()
+            cc_denom = pred_centered.norm() * gt_centered.norm()
+            per_CC.append(float((pred_centered * gt_centered).sum() /
+                                cc_denom.clamp_min(1e-30)))
+            mae_b = error_mv.abs().mean().item()
+            ss_res = error_mv.square().sum()
+            ss_tot = (gt_mv - gt_mv.mean()).square().sum()
+            r2_b = float(1.0 - ss_res / (ss_tot + 1e-30))
             per_B.append((mae_b, r2_b))
 
             m1 = (li == 1) & mask
@@ -78,7 +103,22 @@ def eval_samples(model, samples, device, tag='', feature_fn=None, anchor_frac=0.
                 mae_a, f1_a, cc_a = float('nan'), float('nan'), float('nan')
             else:
                 mm_a = torch.from_numpy(m1).to(device)
-                mae_a, f1_a, cc_a = metrics_A(drop_pred[mm_a], drop_gt_n[mm_a], vdd)
+                pred_a, gt_a = pred_mv_all[mm_a], gt_mv_all[mm_a]
+                mae_a = (pred_a - gt_a).abs().mean().item()
+                threshold = 0.9 * gt_a.max()
+                gt_pos, pred_pos = gt_a > threshold, pred_a > threshold
+                tp = int((gt_pos & pred_pos).sum())
+                fp = int((~gt_pos & pred_pos).sum())
+                fn = int((gt_pos & ~pred_pos).sum())
+                precision = tp / (tp + fp) if tp + fp else 0.0
+                recall = tp / (tp + fn) if tp + fn else 0.0
+                f1_a = (2 * precision * recall / (precision + recall)
+                        if precision + recall else 0.0)
+                pred_a_c = pred_a - pred_a.mean()
+                gt_a_c = gt_a - gt_a.mean()
+                cc_denom = pred_a_c.norm() * gt_a_c.norm()
+                cc_a = float((pred_a_c * gt_a_c).sum() /
+                             cc_denom.clamp_min(1e-30))
             per_A.append((mae_a, f1_a, cc_a))
             per_tc.append((tc, mae_a, f1_a, cc_a, mae_b, r2_b, runtime))
         except Exception as ex:
@@ -99,6 +139,10 @@ def eval_samples(model, samples, device, tag='', feature_fn=None, anchor_frac=0.
         'per_tc'   : per_tc,
         'mean_A'   : _mean(per_A, mask_nan=True),
         'mean_B'   : _mean(per_B),
+        'mean_mse' : float(np.mean(per_MSE)) if per_MSE else float('nan'),
+        'within10_pct': (100.0 * within10_nodes / valid_nodes
+                         if valid_nodes else float('nan')),
+        'mean_CC': float(np.nanmean(per_CC)) if per_CC else float('nan'),
         'mean_time': float(np.mean(per_T)) if per_T else float('nan'),
     }
 
@@ -125,9 +169,9 @@ def print_group_table(result, label):
 
 def format_epoch_line(result, prefix='real'):
     """Compact one-line summary for per-epoch training logs."""
-    mA = result.get('mean_A') or (float('nan'),)*3
     mB = result.get('mean_B') or (float('nan'),)*2
-    return (f'{prefix} A[MAE={mA[0]:.4f} F1={mA[1]:.3f} CC={mA[2]:+.3f}] '
-            f'B[MAE={mB[0]:.4f} R2={mB[1]:+.3f}]')
+    return (f'{prefix}[MAE={mB[0]:.4f}mV '
+            f'within10={result.get("within10_pct", float("nan")):.2f}% '
+            f'R2={mB[1]:+.3f} CC={result.get("mean_CC", float("nan")):+.3f}]')
 
 
