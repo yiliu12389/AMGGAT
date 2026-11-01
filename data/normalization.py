@@ -94,17 +94,16 @@ def restore_zscore(values, stats):
 
 
 def normalize_graph(graph, stats):
-    graph['edge_feat'] = apply_zscore(graph['edge_feat'].unsqueeze(-1), stats).squeeze(-1)
+    """Keep edge features as log1p conductances, matching the old pipeline."""
     return graph
 
 
 def normalize_precomputed_levels(samples, stats_by_level):
-    """Apply train-fitted statistics to precomputed AMG graphs/features in place."""
+    """Normalize node features; keep log1p edge features in physical graph scale."""
     for sample in samples:
         for level, stats in enumerate(stats_by_level):
             if level >= sample['n_levels']:
                 break
-            normalize_graph(sample['graphs'][level], stats['edge'])
             if level > 0 and sample['cfeats'][level] is not None:
                 sample['cfeats'][level] = apply_node_zscore(
                     sample['cfeats'][level], stats['node'])

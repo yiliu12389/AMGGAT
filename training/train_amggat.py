@@ -9,7 +9,8 @@ from data.amg_dataset import precompute
 from evaluation.metrics import (
     format_epoch_line, metrics_A, metrics_B, print_group_table,
 )
-from models.amg_gat import AMGGAT
+from models.coarsetofine import AMGGAT
+from models.total import TotalAMGGAT
 from amg.hierarchy import build_amg_hierarchy, prep_hierarchy
 from data.normalization import (
     apply_node_zscore, fit_stats, normalize_precomputed_levels,
@@ -24,7 +25,8 @@ from data.normalization import (
 def eval_amg(model, precomp, device, n_model_levels=4, node_stats=None,
              target_stats=None):
     model.eval()
-    per_A, per_B = [], []
+    per_A, per_B, per_relative, per_tc = [], [], [], []
+    relative_sum, relative_count, within10_count = 0.0, 0, 0
     with torch.no_grad():
         for s in precomp:
             if s['n_levels'] < n_model_levels:
@@ -47,9 +49,27 @@ def eval_amg(model, precomp, device, n_model_levels=4, node_stats=None,
                 m1 = torch.from_numpy((s['layer_idx'] == 1) & s['mask']).to(device)
                 mae_b, r2_b = metrics_B(drop[m], drop_gt_n[m], s['vdd'])
                 per_B.append((mae_b, r2_b))
+                pred_mv = drop[m] * s['vdd'] * 1000.0
+                gt_mv = drop_gt_n[m] * s['vdd'] * 1000.0
+                pred_c = pred_mv - pred_mv.mean()
+                gt_c = gt_mv - gt_mv.mean()
+                cc = float((pred_c * gt_c).sum() /
+                           (pred_c.norm() * gt_c.norm()).clamp_min(1e-30))
+                relative = ((pred_mv - gt_mv).abs() /
+                            gt_mv.abs().clamp_min(1e-8))
+                relative_metrics = (
+                    relative.mean().item(),
+                    relative.median().item(),
+                    (relative <= 0.10).float().mean().item(),
+                )
+                per_relative.append(relative_metrics)
+                relative_sum += relative.sum().item()
+                relative_count += int(relative.numel())
+                within10_count += int((relative <= 0.10).sum().item())
                 if m1.sum() > 0:
                     mae_a, f1_a, cc_a = metrics_A(drop[m1], drop_gt_n[m1], s['vdd'])
                     per_A.append((mae_a, f1_a, cc_a))
+                per_tc.append((s['tc'], mae_b, r2_b, cc, *relative_metrics))
             except Exception as e:
                 print(f'  eval skip {s["tc"]}: {e}', flush=True)
 
@@ -60,7 +80,27 @@ def eval_amg(model, precomp, device, n_model_levels=4, node_stats=None,
         return tuple(a.mean(axis=0).tolist())
 
     return {'mean_A': _mean(per_A), 'mean_B': _mean(per_B),
-            'tag': '', 'per_tc': []}
+            'mean_relative': _mean(per_relative),
+            'node_mape': (relative_sum / relative_count
+                          if relative_count else float('nan')),
+            'node_within10': (within10_count / relative_count
+                              if relative_count else float('nan')),
+            'tag': '', 'per_tc': per_tc}
+
+
+def print_amg_group_table(result, label):
+    print(f'\n===== {label} ({len(result["per_tc"])} testcases) =====',
+          flush=True)
+    print(f'  {"testcase":12s} | {"MAE(mV)":>10s} {"R2":>9s} '
+          f'{"CC":>8s} {"MAPE":>8s} {"median":>8s} {"<=10%":>8s}',
+          flush=True)
+    print('  ' + '-' * 80, flush=True)
+    for tc, mae, r2, cc, mape, median, within10 in result['per_tc']:
+        print(f'  {tc:12s} | {mae:10.4f} {r2:+9.4f} {cc:+8.4f} '
+              f'{100*mape:7.2f}% {100*median:7.2f}% {100*within10:7.2f}%',
+              flush=True)
+    print(f'  ALL NODES    | relative MAPE={100*result["node_mape"]:.2f}% '
+          f'within10={100*result["node_within10"]:.2f}%', flush=True)
 
 
 def format_line(r, label):
@@ -87,12 +127,21 @@ if __name__ == '__main__':
     HEADS       = int(os.environ.get('HEADS', 4))
     LAYERS      = os.environ.get('LAYERS', '3,3,3,3')
     MAX_LEVELS  = int(os.environ.get('MAX_LEVELS', 4))
-    CKPT_NAME   = os.environ.get('CKPT_NAME', 'ckpt_amg_gat')
+    MODEL_NAME  = os.environ.get('MODEL', 'coarsetofine').lower()
+    default_ckpt = ('checkpoints/total4_global_zscore'
+                    if MODEL_NAME == 'total'
+                    else 'checkpoints/coarsetofine4_global_zscore')
+    CKPT_NAME   = os.environ.get('CKPT_NAME', default_ckpt)
     WARMUP      = int(os.environ.get('WARMUP', 5))
+    EVAL_EVERY  = int(os.environ.get('EVAL_EVERY', 10))
 
     layers_per_level = tuple(int(x) for x in LAYERS.split(','))
     n_levels = len(layers_per_level)
     in_dim = 5
+    if MODEL_NAME not in ('coarsetofine', 'total'):
+        raise ValueError('MODEL must be coarsetofine or total')
+    if MODEL_NAME == 'total' and len(set(layers_per_level)) != 1:
+        raise ValueError('total requires the same GAT depth at every level')
 
     print(f'Device: {device}', flush=True)
 
@@ -105,13 +154,14 @@ if __name__ == '__main__':
 
     print('Precomputing AMG hierarchies...', flush=True)
     t1 = time.time()
-    train_data  = precompute(train_raw,  device, MAX_LEVELS)
-    real_data   = precompute(real_raw,   device, MAX_LEVELS)
-    hidden_data = precompute(hidden_raw, device, MAX_LEVELS)
+    solve_targets = os.environ.get('SOLVE_COARSE_TARGETS', '0') == '1'
+    train_data  = precompute(train_raw,  device, MAX_LEVELS, solve_targets)
+    real_data   = precompute(real_raw,   device, MAX_LEVELS, solve_targets)
+    hidden_data = precompute(hidden_raw, device, MAX_LEVELS, solve_targets)
     print(f'  train={len(train_data)} real={len(real_data)} '
           f'hidden={len(hidden_data)}  ({time.time()-t1:.0f}s)', flush=True)
 
-    print('Fitting per-level node/edge z-score statistics on training circuits...',
+    print('Fitting per-level node z-score statistics; keeping log1p edges...',
           flush=True)
     level_stats = []
     for level in range(n_levels):
@@ -122,12 +172,9 @@ if __name__ == '__main__':
         else:
             node_batches = [s['cfeats'][level][:, :4] for s in train_data
                             if s['n_levels'] > level and s['cfeats'][level] is not None]
-        edge_batches = [s['graphs'][level]['edge_feat'].unsqueeze(-1)
-                        for s in train_data if s['n_levels'] > level]
-        if not node_batches or not edge_batches:
+        if not node_batches:
             raise ValueError(f'No training examples available for AMG level {level}')
-        level_stats.append({'node': fit_stats(node_batches, 4),
-                            'edge': fit_stats(edge_batches, 1)})
+        level_stats.append({'node': fit_stats(node_batches, 4)})
     target_batches = []
     for sample in train_data:
         valid = sample['mask'].astype(bool)
@@ -142,17 +189,48 @@ if __name__ == '__main__':
     print('  fitted per-level stats by equal-weight averaging across train circuits; '
           'test uses train stats', flush=True)
 
-    model = AMGGAT(in_dim=in_dim, head_dim=HEAD_DIM, heads=HEADS,
-                   layers_per_level=layers_per_level).to(device)
+    if MODEL_NAME == 'total':
+        model = TotalAMGGAT(
+            n_levels=n_levels, feature_dim=in_dim, head_dim=HEAD_DIM,
+            heads=HEADS, gat_layers=layers_per_level[0]).to(device)
+    else:
+        model = AMGGAT(in_dim=in_dim, head_dim=HEAD_DIM, heads=HEADS,
+                       layers_per_level=layers_per_level).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f'AMGGAT  layers={layers_per_level}  head_dim={HEAD_DIM}  '
+    print(f'{MODEL_NAME}  layers={layers_per_level}  head_dim={HEAD_DIM}  '
           f'heads={HEADS}  in_dim={in_dim}  params={n_params:,}', flush=True)
 
     def eval_on(data, label):
         r = eval_amg(model, data, device, n_model_levels=n_levels,
                      node_stats=level_stats, target_stats=target_stats)
-        print(format_line(r, label), flush=True)
+        if label is not None:
+            print(format_line(r, label), flush=True)
         return r
+
+    if os.environ.get('EVAL_ONLY', '0') == '1':
+        checkpoint_path = os.environ.get('EVAL_CKPT', CKPT_NAME + '_best.pt')
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model'])
+        train_result = eval_on(train_data, 'TRAIN (best checkpoint)')
+        real_result = eval_on(real_data, 'REAL TEST (best checkpoint)')
+        hidden_result = eval_on(hidden_data, 'HIDDEN TEST (best checkpoint)')
+        print_amg_group_table(train_result, 'TRAIN per-circuit')
+        print_amg_group_table(real_result, 'REAL per-circuit')
+        print_amg_group_table(hidden_result, 'HIDDEN per-circuit')
+        raise SystemExit(0)
+
+    def compact_eval(r):
+        if r['mean_B'] is None:
+            return 'MAE=nanmV R2=nan CC=nan MAPE=nan% <=10=nan%'
+        mae, r2 = r['mean_B']
+        if r['mean_A'] is None:
+            return f'MAE={mae:.5f}mV R2={r2:+.4f} CC=nan MAPE=nan% <=10=nan%'
+        _, _, cc = r['mean_A']
+        rel = r['mean_relative']
+        return (f'MAE={mae:.5f}mV R2={r2:+.4f} CC={cc:+.4f} '
+                f'MAPE={100.0 * rel[0]:.2f}% '
+                f'median={100.0 * rel[1]:.2f}% '
+                f'<=10={100.0 * rel[2]:.2f}%')
 
     opt = torch.optim.Adam(model.parameters(), lr=LR)
     warmup_sch = torch.optim.lr_scheduler.LinearLR(
@@ -162,7 +240,7 @@ if __name__ == '__main__':
     sch = torch.optim.lr_scheduler.SequentialLR(
         opt, schedulers=[warmup_sch, cosine_sch], milestones=[WARMUP])
 
-    best_train_loss = float('inf')
+    best_real_mae = float('inf')
     t_train = time.time()
 
     for epoch in range(1, N_EPOCHS + 1):
@@ -204,18 +282,27 @@ if __name__ == '__main__':
         train_loss = ep_sup / d
         msg = (f'epoch {epoch:3d}  lr={lr_now:.2e}  '
                f'train_RMS={rmse:.4f}mV  ({time.time()-t_train:.0f}s)')
-        if train_loss < best_train_loss:
-            best_train_loss = train_loss
-            torch.save({'model': model.state_dict(),
-                        'level_stats': level_stats,
-                        'target_stats': target_stats}, CKPT_NAME + '_best.pt')
+        if epoch % EVAL_EVERY == 0:
+            real_result = eval_on(real_data, None)
+            hidden_result = eval_on(hidden_data, None)
+            real_mae = (real_result['mean_B'][0]
+                        if real_result['mean_B'] is not None else float('inf'))
+            msg += (f' || REAL {compact_eval(real_result)}; '
+                    f'HIDDEN {compact_eval(hidden_result)}')
+            if real_mae < best_real_mae:
+                best_real_mae = real_mae
+                torch.save({'model': model.state_dict(),
+                            'level_stats': level_stats,
+                            'target_stats': target_stats,
+                            'best_real_mae': best_real_mae},
+                           CKPT_NAME + '_best.pt')
         print(msg, flush=True)
 
     torch.save({'model': model.state_dict(),
                 'level_stats': level_stats,
                 'target_stats': target_stats}, CKPT_NAME + '_final.pt')
     print('=' * 64, flush=True)
-    print(f'best train loss: {best_train_loss:.6g}', flush=True)
+    print(f'best REAL MAE: {best_real_mae:.6g}mV', flush=True)
 
     if os.path.exists(CKPT_NAME + '_best.pt'):
         checkpoint = torch.load(CKPT_NAME + '_best.pt', map_location=device)

@@ -5,7 +5,7 @@ from amg.hierarchy import (
 )
 
 
-def precompute(samples, device, max_levels=4):
+def precompute(samples, device, max_levels=4, solve_targets=True):
     prepared = []
     for tc, matrix, rhs, b_vdd, b_isource, layers, x_gt, mask, vdd in samples:
         try:
@@ -13,7 +13,8 @@ def precompute(samples, device, max_levels=4):
                 matrix, max_levels=max_levels, coarse_mask=(b_vdd != 0))
             # Exact voltage solutions x1, x2, ... used as optional local
             # supervision targets.  x_coarse[l] lives on A_l.
-            coarse_results = solve_coarse_level_systems(levels, rhs)
+            coarse_results = (solve_coarse_level_systems(levels, rhs)
+                              if solve_targets else [])
             x_coarse = [None] + [result['x'] for result in coarse_results]
             graphs, coarse_features, prolongations, bv, bi, li = prep_hierarchy(
                 levels, b_vdd, b_isource, layers, device)

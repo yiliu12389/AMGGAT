@@ -30,3 +30,54 @@ def build_features(matrix, b_vdd, b_isource, layer_idx, device,
     columns = [boundary_rhs, current, diagonal_log, degree_log, layer]
 
     return torch.from_numpy(np.stack(columns, axis=-1).astype(np.float32)).to(device)
+
+
+def build_features_from_rhs(graph, rhs, layer_idx, node_stats=None,
+                            layer_bounds=None):
+    rhs = torch.as_tensor(rhs, device=graph['A'].device,
+                          dtype=graph['A'].dtype).reshape(-1)
+    n_nodes = graph['n']
+    if rhs.numel() != n_nodes:
+        raise ValueError('rhs length must match the graph node count')
+
+    matrix = graph['A'].to_sparse_coo().coalesce()
+    row, col = matrix.indices()
+    values = matrix.values()
+    diagonal = torch.zeros(n_nodes, device=rhs.device, dtype=rhs.dtype)
+    diagonal_mask = row == col
+    diagonal.scatter_add_(0, row[diagonal_mask], values[diagonal_mask])
+    degree = torch.zeros(n_nodes, device=rhs.device, dtype=rhs.dtype)
+    off_diagonal = ~diagonal_mask
+    degree.scatter_add_(0, row[off_diagonal], torch.ones_like(values[off_diagonal]))
+
+    layer = torch.as_tensor(layer_idx, device=rhs.device,
+                            dtype=rhs.dtype).reshape(-1)
+    if layer.numel() != n_nodes:
+        raise ValueError('layer index length must match the graph node count')
+    if layer_bounds is None:
+        layer_min = layer.min()
+        layer_max = layer.max()
+    else:
+        layer_min = torch.as_tensor(layer_bounds[0], device=rhs.device,
+                                    dtype=rhs.dtype)
+        layer_max = torch.as_tensor(layer_bounds[1], device=rhs.device,
+                                    dtype=rhs.dtype)
+    if bool(layer_max > layer_min):
+        layer = 2.0 * (layer - layer_min) / (layer_max - layer_min) - 1.0
+    else:
+        layer = torch.zeros_like(layer)
+
+    features = torch.stack([
+        rhs.clamp_min(0.0),
+        rhs.clamp_max(0.0),
+        torch.log1p(diagonal.clamp_min(0.0)),
+        torch.log1p(degree),
+        layer,
+    ], dim=-1)
+    if node_stats is not None:
+        mean = torch.as_tensor(node_stats['mean'], device=rhs.device,
+                               dtype=rhs.dtype)
+        std = torch.as_tensor(node_stats['std'], device=rhs.device,
+                              dtype=rhs.dtype)
+        features[:, :4] = (features[:, :4] - mean) / std.clamp_min(1e-8)
+    return features
